@@ -24,16 +24,21 @@ use crate::async_io::{AsyncIo, BorrowedDiskFd, DiskFileError};
 use crate::error::{BlockError, BlockErrorKind, BlockResult, ErrorOp};
 use crate::{disk_file};
 
+// TO-DO
+// Not very clear if we can enable io_uring for VMDK.
+// 2GBMaxExtentFlat comprises of multiple split extents.
+// In such case, read request spanning extents will not be able to be handled
+// with current io_uring's one fd + one offset model.
+// Not enabling io_uring for now.
 #[derive(Debug)]
-#[cfg_attr(not(test), expect(dead_code))]
 pub struct VmdkDisk {
     inner: FlatVmdk,
     use_io_uring: bool,
 }
 
 impl VmdkDisk {
-    pub fn new(file: std::fs::File) -> Result<Self, crate::error::BlockError> {
-        let inner = FlatVmdk::new(file)?;
+    pub fn new(file: std::fs::File, path: &std::path::Path) -> Result<Self, crate::error::BlockError> {
+        let inner = FlatVmdk::new(file, path)?;
         Ok(VmdkDisk {
             inner,
             use_io_uring: false,
@@ -43,16 +48,22 @@ impl VmdkDisk {
 
 impl disk_file::DiskSize for VmdkDisk {
     fn logical_size(&self) -> BlockResult<u64> {
-        Ok(0) // TO-DO: Implement a proper check for flat VMDK files
+        Ok(self.inner.virtual_block_size())
     }
 }
 
 impl disk_file::PhysicalSize for VmdkDisk {
     fn physical_size(&self) -> BlockResult<u64> {
-        Ok(0) // TO-DO: Implement a proper check for flat VMDK files
+        Ok(self.inner.physical_block_size())
     }
 }
 
+// Expose the backing fd for advisory image locking only (not data I/O).
+//
+// For VMDK this resolves to the *descriptor* file's fd. The descriptor
+// enumerates every extent, so locking it guards the whole image regardless of
+// whether the layout is single-extent (`monolithicFlat`) or multi-extent
+// (`twoGbMaxExtentFlat`). See `FlatVmdk`'s `AsRawFd` impl for the rationale.
 impl disk_file::DiskFd for VmdkDisk {
     fn fd(&self) -> BorrowedDiskFd<'_> {
         BorrowedDiskFd::new(self.inner.as_raw_fd())

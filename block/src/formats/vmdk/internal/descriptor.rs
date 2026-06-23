@@ -5,6 +5,7 @@
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, BufRead};
+use std::path::Path;
 
 const VMDK_DESCRIPTOR_HEADER: &str = "# Disk DescriptorFile";
 const VMDK_DESCRIPTOR_EXTENTS: &str = "# Extent description";
@@ -40,6 +41,7 @@ pub struct VmdkExtent {
 // - Disk Database
 #[derive(Debug, Default)]
 pub struct VmdkDescriptor {
+    pub base_path: String,
     pub header: VmdkDescriptorHeader,
     pub extents_list: VmdkDescriptorExtents,
     pub ddb: VmdkDescriptorDdb,
@@ -71,7 +73,15 @@ pub struct VmdkDescriptorDdb {
 // TO-DO: Current implementation targets descriptor text as a separate file.
 // This is not always the case, as the descriptor can be embedded.
 impl VmdkDescriptor {
-    pub fn new(file: &File) -> io::Result<Self> {
+    pub fn new(file: &File, path: &Path) -> io::Result<Self> {
+        // Retrieve base path of the file
+        let base_path = path
+            .parent()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput,
+                "Cannot retrieve parent directory of the file"))?
+            .to_string_lossy()
+            .to_string();
+
         // Retrieve the metadata of the passed file
         let metadata = file.metadata()?;
         // Check if the file is empty or invalid
@@ -92,6 +102,7 @@ impl VmdkDescriptor {
         let desc_extents_ddb = parse_extents_and_ddb(&mut reader, &last_line)?;
 
         Ok(Self {
+            base_path,
             header: desc_header,
             extents_list: desc_extents_ddb.0,
             ddb: desc_extents_ddb.1,
@@ -211,7 +222,8 @@ pub(crate) fn parse_extents_and_ddb<R: BufRead>(
 // For any other combination, the function returns false.
 pub fn is_flat_vmdk(f: &mut File) -> io::Result<bool> {
     // constuct a VmdkDescriptor from the file
-    let descriptor = VmdkDescriptor::new(f)?;
+    // TO-DO: don't handle the descriptor file path here.
+    let descriptor = VmdkDescriptor::new(f, Path::new(""))?;
 
     // Only supports flat disk types for now. Other types can be added later.
     match descriptor.header.create_type {
