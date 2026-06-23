@@ -429,6 +429,7 @@ pub fn preallocate_disk<P: AsRef<Path>>(file: &File, path: P) {
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum ImageType {
+    FlatVmdk,
     FixedVhd,
     Qcow2,
     Raw,
@@ -440,6 +441,7 @@ pub enum ImageType {
 impl fmt::Display for ImageType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            ImageType::FlatVmdk => write!(f, "flatvmdk"),
             ImageType::FixedVhd => write!(f, "vhd"),
             ImageType::Qcow2 => write!(f, "qcow2"),
             ImageType::Raw => write!(f, "raw"),
@@ -458,6 +460,7 @@ impl FromStr for ImageType {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_lowercase().as_str() {
+            "vmdk" => Ok(ImageType::FlatVmdk),
             "vhd" => Ok(ImageType::FixedVhd),
             "qcow2" => Ok(ImageType::Qcow2),
             "raw" => Ok(ImageType::Raw),
@@ -511,6 +514,10 @@ pub fn detect_image_type(f: &mut File) -> BlockResult<ImageType> {
         ImageType::FixedVhd
     } else if u64::from_le_bytes(block[0..8].try_into().unwrap()) == VHDX_SIGN {
         ImageType::Vhdx
+    } else if formats::vmdk::is_flat_vmdk(f)
+        .map_err(|e| BlockError::new(BlockErrorKind::Io, e).with_op(ErrorOp::DetectImageType))?
+    {
+        ImageType::FlatVmdk
     } else {
         ImageType::Raw
     };
