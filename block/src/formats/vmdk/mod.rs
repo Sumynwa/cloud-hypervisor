@@ -1,0 +1,282 @@
+// Copyright 2026 The Cloud Hypervisor Authors. All rights reserved.
+//
+// Copyright (c) Meta Platforms, Inc. and affiliates.
+//
+// SPDX-License-Identifier: Apache-2.0
+
+//! Flat VMDK disk image format.
+//!
+//! Provides [`VmdkDisk`], the `DiskFile` wrapper for flat VMDK
+//! images of types `monolithicFlat` and `twoGbMaxExtentFlat`.
+
+pub(crate) mod internal;
+pub(crate) mod worker;
+
+use std::fs::File;
+use std::io;
+use std::os::unix::io::AsRawFd;
+use std::path::Path;
+
+pub use internal::descriptor::{has_descriptor_header, is_flat_vmdk};
+
+use self::internal::flat::FlatVmdk;
+use self::worker::sync::FlatVmdkSync;
+use crate::async_io::{AsyncIo, BorrowedDiskFd, DiskFileError};
+use crate::error::{BlockError, BlockErrorKind, BlockResult, ErrorOp};
+use crate::{DiskTopology, disk_file};
+// VMDK uses a synchronous, extent-aware worker (see `worker::sync`) that maps
+// each request to the backing extent(s). This supports both single-extent
+// `monolithicFlat` and multi-extent `twoGbMaxExtentFlat` images.
+//
+// io_uring/AIO remain disabled for VMDK: their one-fd + one-offset submission
+// model cannot express a single request that spans two extent files, so a
+// `twoGbMaxExtentFlat` boundary-crossing request has no direct kernel-async
+// representation. The synchronous worker handles that by splitting the request
+// across extents in user space.
+#[derive(Debug)]
+pub struct VmdkDisk {
+    inner: FlatVmdk,
+    use_async_io: bool,
+}
+
+impl VmdkDisk {
+    /// Builds a flat VMDK disk backend.
+    ///
+    /// `direct` mirrors the disk's `direct=on`/`off` configuration and selects
+    /// whether the backing extents are opened with `O_DIRECT`. It is threaded
+    /// straight through to [`FlatVmdk::new`], consistent with the other block
+    /// formats
+    pub fn new(
+        file: File,
+        path: &Path,
+        direct: bool,
+        enable_async_io: bool,
+    ) -> Result<Self, BlockError> {
+        let inner = FlatVmdk::new(file, path, direct)?;
+        Ok(VmdkDisk {
+            inner,
+            use_async_io: enable_async_io,
+        })
+    }
+}
+
+// Not implementing `BlockBackend` for VmdkDisk.
+// The `DiskFile` trait is now used instead, which provides the
+// necessary functionality for disk operations.
+impl disk_file::DiskSize for VmdkDisk {
+    fn logical_size(&self) -> BlockResult<u64> {
+        Ok(self.inner.virtual_block_size())
+    }
+}
+
+impl disk_file::PhysicalSize for VmdkDisk {
+    fn physical_size(&self) -> BlockResult<u64> {
+        Ok(self.inner.physical_block_size())
+    }
+}
+
+// Expose the backing fd for advisory image locking only (not data I/O).
+//
+// For VMDK this resolves to the *descriptor* file's fd. The descriptor
+// enumerates every extent, so locking it guards the whole image regardless of
+// whether the layout is single-extent (`monolithicFlat`) or multi-extent
+// (`twoGbMaxExtentFlat`). See `FlatVmdk`'s `AsRawFd` impl for the rationale.
+impl disk_file::DiskFd for VmdkDisk {
+    fn fd(&self) -> BorrowedDiskFd<'_> {
+        BorrowedDiskFd::new(self.inner.as_raw_fd())
+    }
+}
+
+impl disk_file::Geometry for VmdkDisk {
+    fn topology(&self) -> DiskTopology {
+        self.inner.topology()
+    }
+}
+
+impl disk_file::SparseCapable for VmdkDisk {}
+
+impl disk_file::Resizable for VmdkDisk {
+    fn resize(&mut self, _size: u64) -> BlockResult<()> {
+        Err(BlockError::new(
+            BlockErrorKind::UnsupportedFeature,
+            DiskFileError::ResizeError(io::Error::other("resize not supported for flat VMDK")),
+        )
+        .with_op(ErrorOp::Resize))
+    }
+}
+
+impl disk_file::DiskFile for VmdkDisk {}
+
+impl disk_file::AsyncDiskFile for VmdkDisk {
+    fn try_clone(&self) -> BlockResult<Box<dyn disk_file::AsyncDiskFile>> {
+        Ok(Box::new(VmdkDisk {
+            inner: self.inner.clone(),
+            use_async_io: self.use_async_io,
+        }))
+    }
+
+    fn create_async_io(&self, ring_depth: u32) -> BlockResult<Box<dyn AsyncIo>> {
+        // VMDK provides a synchronous, extent-aware worker, so the io_uring ring
+        // depth is unused here.
+        let _ = ring_depth;
+
+        // The extent-aware worker maps each request to the backing extent(s), so
+        // it handles both single-extent `monolithicFlat` and multi-extent
+        // `twoGbMaxExtentFlat` images. It is bounded by the virtual disk size so
+        // out-of-range requests are rejected.
+        Ok(Box::new(
+            FlatVmdkSync::new(self.inner.extents(), self.inner.virtual_block_size()).map_err(
+                |e| {
+                    BlockError::new(BlockErrorKind::Io, DiskFileError::NewAsyncIo(e))
+                        .with_op(ErrorOp::Open)
+                },
+            )?,
+        ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Write;
+    use std::os::unix::io::AsRawFd;
+    use std::path::PathBuf;
+
+    use vmm_sys_util::tempdir::TempDir;
+
+    use super::*;
+    use crate::disk_file::{AsyncDiskFile, DiskFd, DiskSize, PhysicalSize, Resizable};
+
+    const SECTOR: u64 = 512;
+
+    // Writes a flat VMDK into `dir`: a backing data file per extent (sized to
+    // `sectors * 512`) plus a descriptor referencing them by name. `extents`
+    // entries are (filename, access, sectors). Returns the descriptor path.
+    fn write_flat_vmdk(dir: &Path, create_type: &str, extents: &[(&str, &str, u64)]) -> PathBuf {
+        let mut desc = String::from("# Disk DescriptorFile\n");
+        desc.push_str("version=1\n");
+        desc.push_str("CID=fffffffe\n");
+        desc.push_str("parentCID=ffffffff\n");
+        desc.push_str(&format!("createType={create_type}\n"));
+        desc.push_str("# Extent description\n");
+
+        for (filename, access, sectors) in extents {
+            // Create the backing data file at the declared size.
+            let data = File::create(dir.join(filename)).unwrap();
+            data.set_len(sectors * SECTOR).unwrap();
+            desc.push_str(&format!("{access} {sectors} FLAT \"{filename}\"\n"));
+        }
+
+        desc.push_str("# The Disk Data Base\n");
+        desc.push_str("ddb.adapterType = \"ide\"\n");
+
+        let desc_path = dir.join("disk.vmdk");
+        let mut df = File::create(&desc_path).unwrap();
+        df.write_all(desc.as_bytes()).unwrap();
+        df.sync_all().unwrap();
+        desc_path
+    }
+
+    fn open_descriptor(path: &Path) -> File {
+        File::open(path).unwrap()
+    }
+
+    #[test]
+    fn logical_and_physical_size_single_extent() {
+        let dir = TempDir::new_with_prefix("/tmp/vmdk-test").unwrap();
+        let path = write_flat_vmdk(
+            dir.as_path(),
+            "monolithicFlat",
+            &[("disk-flat.vmdk", "RW", 2048)],
+        );
+        let disk = VmdkDisk::new(open_descriptor(&path), &path, false, false).unwrap();
+
+        assert_eq!(disk.logical_size().unwrap(), 2048 * SECTOR);
+        assert_eq!(disk.physical_size().unwrap(), 2048 * SECTOR);
+    }
+
+    #[test]
+    fn logical_size_sums_multiple_extents() {
+        let dir = TempDir::new_with_prefix("/tmp/vmdk-test").unwrap();
+        let path = write_flat_vmdk(
+            dir.as_path(),
+            "twoGbMaxExtentFlat",
+            &[("s001.vmdk", "RW", 2048), ("s002.vmdk", "RW", 1024)],
+        );
+        let disk = VmdkDisk::new(open_descriptor(&path), &path, false, false).unwrap();
+
+        assert_eq!(disk.logical_size().unwrap(), (2048 + 1024) * SECTOR);
+        assert_eq!(disk.physical_size().unwrap(), (2048 + 1024) * SECTOR);
+    }
+
+    #[test]
+    fn fd_exposes_descriptor_file() {
+        let dir = TempDir::new_with_prefix("/tmp/vmdk-test").unwrap();
+        let path = write_flat_vmdk(
+            dir.as_path(),
+            "monolithicFlat",
+            &[("disk-flat.vmdk", "RW", 64)],
+        );
+        let file = open_descriptor(&path);
+        let expected = file.as_raw_fd();
+
+        let disk = VmdkDisk::new(file, &path, false, false).unwrap();
+
+        // DiskFd exposes the descriptor file's fd (used for advisory locking).
+        assert_eq!(disk.fd().as_raw_fd(), expected);
+    }
+
+    #[test]
+    fn resize_is_unsupported() {
+        let dir = TempDir::new_with_prefix("/tmp/vmdk-test").unwrap();
+        let path = write_flat_vmdk(
+            dir.as_path(),
+            "monolithicFlat",
+            &[("disk-flat.vmdk", "RW", 64)],
+        );
+        let mut disk = VmdkDisk::new(open_descriptor(&path), &path, false, false).unwrap();
+
+        let err = disk.resize(4096).unwrap_err();
+        assert_eq!(err.kind(), BlockErrorKind::UnsupportedFeature);
+    }
+
+    #[test]
+    fn try_clone_preserves_size() {
+        let dir = TempDir::new_with_prefix("/tmp/vmdk-test").unwrap();
+        let path = write_flat_vmdk(
+            dir.as_path(),
+            "monolithicFlat",
+            &[("disk-flat.vmdk", "RW", 2048)],
+        );
+        let disk = VmdkDisk::new(open_descriptor(&path), &path, false, false).unwrap();
+
+        let cloned = disk.try_clone().unwrap();
+        assert_eq!(cloned.logical_size().unwrap(), disk.logical_size().unwrap());
+    }
+
+    #[test]
+    fn create_async_io_builds_worker() {
+        let dir = TempDir::new_with_prefix("/tmp/vmdk-test").unwrap();
+        let path = write_flat_vmdk(
+            dir.as_path(),
+            "monolithicFlat",
+            &[("disk-flat.vmdk", "RW", 2048)],
+        );
+        let disk = VmdkDisk::new(open_descriptor(&path), &path, false, false).unwrap();
+
+        // Ring depth is ignored by the synchronous VMDK worker.
+        disk.create_async_io(0).unwrap();
+    }
+
+    #[test]
+    fn create_async_io_supports_multi_extent() {
+        let dir = TempDir::new_with_prefix("/tmp/vmdk-test").unwrap();
+        let path = write_flat_vmdk(
+            dir.as_path(),
+            "twoGbMaxExtentFlat",
+            &[("s001.vmdk", "RW", 2048), ("s002.vmdk", "RW", 2048)],
+        );
+        let disk = VmdkDisk::new(open_descriptor(&path), &path, false, false).unwrap();
+
+        disk.create_async_io(32).unwrap();
+    }
+}

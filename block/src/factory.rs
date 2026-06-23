@@ -24,6 +24,7 @@ use crate::formats::qcow::QcowDisk;
 use crate::formats::raw::{RawBackend, RawDisk};
 use crate::formats::vhd::VhdDisk;
 use crate::formats::vhdx::VhdxDisk;
+use crate::formats::vmdk::VmdkDisk;
 use crate::{
     ImageType, block_aio_is_supported, detect_image_type, open_disk_image, preallocate_disk,
 };
@@ -91,13 +92,29 @@ pub fn open_disk(options: &DiskOpenOptions<'_>) -> BlockResult<OpenedDisk> {
     }
 
     let mut file = open_disk_image(options.path, &fs_options)?;
-    let image_type = detect_image_type(&mut file)?;
+
+    // Image-type detection performs small, byte-granular probes:
+    // In case of VMDK, it parses the VMDK descriptor text through a `BufReader`.
+    // Those reads are not block-aligned, so under
+    // `O_DIRECT` (which requires the buffer address, length and offset to all
+    // be block-aligned) they fail with `EINVAL`. Detect the format on a
+    // separate buffered handle; the `O_DIRECT` `file` is retained for backend
+    // I/O.
+    let image_type = if options.direct {
+        let mut detect_options = fs::OpenOptions::new();
+        detect_options.read(true);
+        let mut detect_file = open_disk_image(options.path, &detect_options)?;
+        detect_image_type(&mut detect_file)?
+    } else {
+        detect_image_type(&mut file)?
+    };
 
     let disk: Box<dyn AsyncFullDiskFile> = match image_type {
         ImageType::FixedVhd => open_fixed_vhd(file, options)?,
         ImageType::Raw => open_raw(file, options)?,
         ImageType::Qcow2 => open_qcow2(file, options)?,
         ImageType::Vhdx => open_vhdx(file, options)?,
+        ImageType::FlatVmdk => open_flat_vmdk(file, options)?,
         ImageType::Unknown => {
             return Err(
                 BlockError::from_kind(BlockErrorKind::UnsupportedFeature).with_path(options.path)
@@ -212,6 +229,17 @@ fn open_qcow2(
             false,
         )
         .map_err(|e| e.with_path(options.path))?,
+    ))
+}
+
+fn open_flat_vmdk(
+    file: fs::File,
+    options: &DiskOpenOptions<'_>,
+) -> BlockResult<Box<dyn AsyncFullDiskFile>> {
+    info!("Opening VMDK disk file with synchronous backend");
+    Ok(Box::new(
+        VmdkDisk::new(file, options.path, options.direct, false)
+            .map_err(|e| e.with_path(options.path))?,
     ))
 }
 

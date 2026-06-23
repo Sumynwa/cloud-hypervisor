@@ -6,7 +6,7 @@ use std::fs::File;
 use std::io;
 use std::os::unix::fs::FileExt;
 
-use crate::{AlignedFile, query_device_size};
+use crate::{AlignedFile, SECTOR_SIZE, query_device_size};
 
 // Production code uses: cookie, file_format_version, data_offset,
 // current_size, disk_type. The remaining fields are parsed for VHD
@@ -119,6 +119,17 @@ impl VhdFooter {
 
 /// Determine image type through file parsing.
 pub fn is_fixed_vhd(f: &mut File) -> io::Result<bool> {
+    // A fixed VHD stores its footer in the final block of the file, so the file
+    // is always at least one block long. A file smaller than one logical block
+    // cannot be a fixed VHD - for example a VMDK monolithicFlat *descriptor*,
+    // which is few hundred bytes (well under 512). Bailing out early also avoids
+    // `VhdFooter::new` seeking to `End - 512`, which for such a short
+    // file underflows to a negative offset and fails with `EINVAL`, aborting
+    // image-type detection before the VMDK probe ever runs.
+    if f.metadata()?.len() < SECTOR_SIZE {
+        return Ok(false);
+    }
+
     let footer = VhdFooter::new(f)?;
 
     // "conectix" => 0x636f6e6563746978
@@ -221,6 +232,19 @@ mod unit_tests {
         with_file(&valid_fixed_vhd_footer(), |mut file: File| {
             assert!(is_fixed_vhd(&mut file).unwrap());
         });
+    }
+
+    // A file smaller than one logical block (e.g. a small VMDK descriptor)
+    // must report "not a fixed VHD" rather than failing: seeking to
+    // `End - blocksize` would underflow to a negative offset and return EINVAL.
+    #[test]
+    fn test_is_fixed_vhd_short_file_is_not_vhd() {
+        let mut file: File = TempFile::new().unwrap().into_file();
+        file.write_all(b"# Disk DescriptorFile\ncreateType=monolithicFlat\n")
+            .unwrap();
+        file.seek(SeekFrom::Start(0)).unwrap();
+
+        assert!(!is_fixed_vhd(&mut file).unwrap());
     }
 
     #[test]
