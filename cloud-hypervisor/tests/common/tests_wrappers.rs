@@ -2168,6 +2168,86 @@ pub fn _test_virtio_block_dynamic_vhdx_expand(guest: &Guest) {
     disk_check_consistency(vhdx_path, None);
 }
 
+/// Boot a guest whose root disk is a flat VMDK image and exercise its
+/// read/write paths end to end.
+///
+/// `UbuntuDiskConfig` prepares a RAW OS disk; we convert it into a flat VMDK
+/// (`subformat`) inside the guest's tmp_dir so the descriptor and its extent
+/// file(s) stay co-located (a flat VMDK descriptor references its extents by
+/// relative filename). The block backend supports two flat subformats:
+///   - `monolithicFlat`    -> descriptor + a single flat extent
+///   - `twoGbMaxExtentFlat` -> descriptor + one flat extent per 2 GiB
+pub(crate) fn _test_virtio_block_vmdk(guest: &Guest, subformat: &str) {
+    let raw_os_disk = guest.disk_config.disk(DiskType::OperatingSystem).unwrap();
+    let vmdk_path = guest.tmp_dir.as_path().join("osdisk.vmdk");
+    let vmdk_path_str = vmdk_path.to_str().unwrap();
+
+    // Convert the prepared RAW OS disk into a flat VMDK. qemu-img writes the
+    // extent file(s) next to the descriptor automatically.
+    let convert = std::process::Command::new("qemu-img")
+        .arg("convert")
+        .args(["-f", "raw"])
+        .args(["-O", "vmdk"])
+        .args(["-o", &format!("subformat={subformat}")])
+        .arg(&raw_os_disk)
+        .arg(vmdk_path_str)
+        .output()
+        .expect("Expect generating flat VMDK image from RAW image");
+    assert!(
+        convert.status.success(),
+        "qemu-img convert to VMDK (subformat={subformat}) failed: {}",
+        String::from_utf8_lossy(&convert.stderr)
+    );
+
+    let mut cloud_child = GuestCommand::new(guest)
+        .default_cpus()
+        .default_memory()
+        .default_kernel_cmdline()
+        .args([
+            "--disk",
+            // Force the flat VMDK backend explicitly instead of relying on
+            // image-format auto-detection.
+            format!("path={vmdk_path_str},image_type=vmdk").as_str(),
+            format!(
+                "path={}",
+                guest.disk_config.disk(DiskType::CloudInit).unwrap()
+            )
+            .as_str(),
+        ])
+        .default_net()
+        .capture_output()
+        .spawn()
+        .unwrap();
+
+    let r = std::panic::catch_unwind(|| {
+        guest.wait_vm_boot().unwrap();
+
+        // We booted from the VMDK-backed root device: basic sanity checks.
+        assert_eq!(guest.get_cpu_count().unwrap_or_default(), 1);
+        assert!(guest.get_total_memory().unwrap_or_default() > 480_000);
+
+        // Exercise the flat VMDK write + read paths through the guest root
+        // filesystem: write a marker file, flush, and read it back.
+        guest
+            .ssh_command(
+                "echo cloud-hypervisor-vmdk | sudo tee /root/vmdk_marker > /dev/null && sync",
+            )
+            .unwrap();
+        assert_eq!(
+            guest
+                .ssh_command("sudo cat /root/vmdk_marker")
+                .unwrap()
+                .trim(),
+            "cloud-hypervisor-vmdk"
+        );
+    });
+
+    kill_child(&mut cloud_child);
+    let output = cloud_child.wait_with_output().unwrap();
+
+    handle_child_output(r, &output);
+}
+
 fn vhdx_image_size(disk_name: &str) -> u64 {
     std::fs::File::open(disk_name)
         .unwrap()

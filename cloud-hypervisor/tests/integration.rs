@@ -1900,6 +1900,18 @@ mod common_parallel {
     }
 
     #[test]
+    fn test_virtio_block_vmdk_monolithic_flat() {
+        let guest = basic_regular_guest!(JAMMY_IMAGE_NAME);
+        _test_virtio_block_vmdk(&guest, "monolithicFlat");
+    }
+
+    #[test]
+    fn test_virtio_block_vmdk_two_gb_max_extent_flat() {
+        let guest = basic_regular_guest!(JAMMY_IMAGE_NAME);
+        _test_virtio_block_vmdk(&guest, "twoGbMaxExtentFlat");
+    }
+
+    #[test]
     fn test_virtio_block_direct_and_firmware() {
         let disk_config = UbuntuDiskConfig::new(JAMMY_IMAGE_NAME.to_string());
         let guest = Guest::new(Box::new(disk_config));

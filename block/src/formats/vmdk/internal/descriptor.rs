@@ -149,7 +149,10 @@ pub(crate) fn parse_header<R: BufRead>(
                 "CID" => header.cid = u32::from_str_radix(parts[1], 16).unwrap_or(0),
                 "parentCID" => header.parent_cid = u32::from_str_radix(parts[1], 16).unwrap_or(0),
                 "createType" => {
-                    header.create_type = match parts[1] {
+                    // Tools such as qemu-img quote the value, e.g.
+                    // createType="monolithicFlat". Strip surrounding quotes
+                    // before matching so real-world descriptors are recognized.
+                    header.create_type = match parts[1].trim_matches('"') {
                         "monolithicFlat" => VMDKDiskType::MonolithicFlat,
                         "twoGbMaxExtentFlat" => VMDKDiskType::TwoGbMaxExtentFlat,
                         _ => VMDKDiskType::CreateTypeUnsupported,
@@ -183,6 +186,12 @@ pub(crate) fn parse_extents_and_ddb<R: BufRead>(
     let mut in_extents_section = true;
     for line in reader.lines() {
         let line = line?;
+        // Tools such as qemu-img separate the extent list, the DDB marker and
+        // the DDB entries with blank lines. Skip any blank/whitespace-only
+        // line so these real-world descriptors are tolerated.
+        if line.trim().is_empty() {
+            continue;
+        }
         if line.starts_with("#") {
             if line == VMDK_DESCRIPTOR_DDB ||
                line == VMDK_DESCRIPTOR_DDB_2 {
@@ -375,13 +384,16 @@ mod tests {
     }
 
     #[test]
-    fn rejects_blank_line_inside_extent_section() {
-        // Documents current strictness: a blank line in the extents section
-        // is treated as a malformed extent line.
+    fn skips_blank_line_inside_extent_section() {
+        // Tools such as qemu-img emit a blank line between the last extent
+        // line and the "# The Disk Data Base" marker. Such blank lines must
+        // be tolerated (skipped) rather than treated as malformed extents.
         let body: &[u8] = b"RW 2097152 FLAT \"disk-flat.vmdk\"\n\
                             \n\
                             # The Disk Data Base\n";
-        assert!(parse_body("# Extent description", body).is_err());
+        let (extents, _ddb) = parse_body("# Extent description", body).unwrap();
+        assert_eq!(extents.extents.len(), 1);
+        assert_eq!(extents.extents[0].filename, "disk-flat.vmdk");
     }
 
     // ---- parse_header ----
@@ -408,6 +420,22 @@ mod tests {
         assert_eq!(header.parent_cid, 0xffff_ffff);
         assert!(matches!(header.create_type, VMDKDiskType::MonolithicFlat));
         assert_eq!(last, "# Extent description");
+    }
+
+    #[test]
+    fn parses_quoted_create_type() {
+        // qemu-img and other tools quote the createType value; the parser
+        // must strip the quotes before matching.
+        let input: &[u8] = b"# Disk DescriptorFile\n\
+                             version=1\n\
+                             createType=\"twoGbMaxExtentFlat\"\n\
+                             # Extent description\n";
+
+        let (header, _last) = parse_hdr(input).unwrap();
+        assert!(matches!(
+            header.create_type,
+            VMDKDiskType::TwoGbMaxExtentFlat
+        ));
     }
 
     // ---- end-to-end ----
@@ -447,5 +475,39 @@ mod tests {
 
         assert!(matches!(header.create_type, VMDKDiskType::TwoGbMaxExtentFlat));
         assert_eq!(extents.extents.len(), 2);
+    }
+
+    #[test]
+    fn full_qemu_style_descriptor() {
+        // Mirrors a real qemu-img monolithicFlat descriptor: quoted
+        // createType, blank lines separating sections, 5-field extent lines
+        // with a trailing offset, and the "#DDB" marker form.
+        let input: &[u8] = b"# Disk DescriptorFile\n\
+                             version=1\n\
+                             CID=eb2295a4\n\
+                             parentCID=ffffffff\n\
+                             createType=\"monolithicFlat\"\n\
+                             \n\
+                             # Extent description\n\
+                             RW 6291456 FLAT \"t-flat.vmdk\" 0\n\
+                             \n\
+                             # The Disk Data Base\n\
+                             #DDB\n\
+                             \n\
+                             ddb.virtualHWVersion = \"4\"\n\
+                             ddb.adapterType = \"ide\"\n";
+
+        let (header, extents, ddb) = parse_full(input).unwrap();
+
+        assert!(matches!(header.create_type, VMDKDiskType::MonolithicFlat));
+        assert_eq!(extents.extents.len(), 1);
+        assert_eq!(extents.extents[0].access, "RW");
+        assert_eq!(extents.extents[0].size_in_sectors, 6_291_456);
+        assert_eq!(extents.extents[0].extent_type, "FLAT");
+        assert_eq!(extents.extents[0].filename, "t-flat.vmdk");
+        assert_eq!(
+            ddb.entries.get("ddb.adapterType").map(String::as_str),
+            Some("\"ide\"")
+        );
     }
 }
