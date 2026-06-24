@@ -197,7 +197,9 @@ pub(crate) fn parse_extents_and_ddb<R: BufRead>(
         if in_extents_section {
             // Parse the extent line
             let parts: Vec<&str> = line.split_whitespace().collect();
-            if parts.len() >= 4 {
+            // TO-DO: For flat extents, we ignore the offset field since
+            // it is always going to be 0.
+            if parts.len() == 4 || parts.len() == 5 {
                 let extent = VmdkExtentHeader {
                     access: parts[0].to_string(),
                     size_in_sectors: parts[1].parse().unwrap_or(0),
@@ -205,6 +207,12 @@ pub(crate) fn parse_extents_and_ddb<R: BufRead>(
                     filename: parts[3].trim_matches('"').to_string(),
                 };
                 extents.extents.push(extent);
+            } else {
+                // Signal malformed extent line, bail
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Malformed VMDK extent line",
+                ));
             }
         } else {
             // Parse the ddb entry line
