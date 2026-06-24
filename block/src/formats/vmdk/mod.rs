@@ -123,3 +123,135 @@ impl disk_file::AsyncDiskFile for VmdkDisk {
         ))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::io::Write;
+    use std::os::unix::io::AsRawFd;
+
+    use vmm_sys_util::tempdir::TempDir;
+
+    use super::*;
+    use crate::disk_file::{AsyncDiskFile, DiskFd, DiskSize, PhysicalSize, Resizable};
+
+    const SECTOR: u64 = 512;
+
+    // Writes a flat VMDK into `dir`: a backing data file per extent (sized to
+    // `sectors * 512`) plus a descriptor referencing them by name. `extents`
+    // entries are (filename, access, sectors). Returns the descriptor path.
+    fn write_flat_vmdk(
+        dir: &std::path::Path,
+        create_type: &str,
+        extents: &[(&str, &str, u64)],
+    ) -> std::path::PathBuf {
+        let mut desc = String::from("# Disk DescriptorFile\n");
+        desc.push_str("version=1\n");
+        desc.push_str("CID=fffffffe\n");
+        desc.push_str("parentCID=ffffffff\n");
+        desc.push_str(&format!("createType={create_type}\n"));
+        desc.push_str("# Extent description\n");
+
+        for (filename, access, sectors) in extents {
+            // Create the backing data file at the declared size.
+            let data = std::fs::File::create(dir.join(filename)).unwrap();
+            data.set_len(sectors * SECTOR).unwrap();
+            desc.push_str(&format!("{access} {sectors} FLAT \"{filename}\"\n"));
+        }
+
+        desc.push_str("# The Disk Data Base\n");
+        desc.push_str("ddb.adapterType = \"ide\"\n");
+
+        let desc_path = dir.join("disk.vmdk");
+        let mut df = std::fs::File::create(&desc_path).unwrap();
+        df.write_all(desc.as_bytes()).unwrap();
+        df.sync_all().unwrap();
+        desc_path
+    }
+
+    fn open_descriptor(path: &std::path::Path) -> std::fs::File {
+        std::fs::File::open(path).unwrap()
+    }
+
+    #[test]
+    fn logical_and_physical_size_single_extent() {
+        let dir = TempDir::new_with_prefix("/tmp/vmdk-test").unwrap();
+        let path =
+            write_flat_vmdk(dir.as_path(), "monolithicFlat", &[("disk-flat.vmdk", "RW", 2048)]);
+        let disk = VmdkDisk::new(open_descriptor(&path), &path, false).unwrap();
+
+        assert_eq!(disk.logical_size().unwrap(), 2048 * SECTOR);
+        assert_eq!(disk.physical_size().unwrap(), 2048 * SECTOR);
+    }
+
+    #[test]
+    fn logical_size_sums_multiple_extents() {
+        let dir = TempDir::new_with_prefix("/tmp/vmdk-test").unwrap();
+        let path = write_flat_vmdk(
+            dir.as_path(),
+            "twoGbMaxExtentFlat",
+            &[("s001.vmdk", "RW", 2048), ("s002.vmdk", "RW", 1024)],
+        );
+        let disk = VmdkDisk::new(open_descriptor(&path), &path, false).unwrap();
+
+        assert_eq!(disk.logical_size().unwrap(), (2048 + 1024) * SECTOR);
+        assert_eq!(disk.physical_size().unwrap(), (2048 + 1024) * SECTOR);
+    }
+
+    #[test]
+    fn fd_exposes_descriptor_file() {
+        let dir = TempDir::new_with_prefix("/tmp/vmdk-test").unwrap();
+        let path = write_flat_vmdk(dir.as_path(), "monolithicFlat", &[("disk-flat.vmdk", "RW", 64)]);
+        let file = open_descriptor(&path);
+        let expected = file.as_raw_fd();
+
+        let disk = VmdkDisk::new(file, &path, false).unwrap();
+
+        // DiskFd exposes the descriptor file's fd (used for advisory locking).
+        assert_eq!(disk.fd().as_raw_fd(), expected);
+    }
+
+    #[test]
+    fn resize_is_unsupported() {
+        let dir = TempDir::new_with_prefix("/tmp/vmdk-test").unwrap();
+        let path = write_flat_vmdk(dir.as_path(), "monolithicFlat", &[("disk-flat.vmdk", "RW", 64)]);
+        let mut disk = VmdkDisk::new(open_descriptor(&path), &path, false).unwrap();
+
+        let err = disk.resize(4096).unwrap_err();
+        assert_eq!(err.kind(), BlockErrorKind::UnsupportedFeature);
+    }
+
+    #[test]
+    fn try_clone_preserves_size() {
+        let dir = TempDir::new_with_prefix("/tmp/vmdk-test").unwrap();
+        let path =
+            write_flat_vmdk(dir.as_path(), "monolithicFlat", &[("disk-flat.vmdk", "RW", 2048)]);
+        let disk = VmdkDisk::new(open_descriptor(&path), &path, false).unwrap();
+
+        let cloned = disk.try_clone().unwrap();
+        assert_eq!(cloned.logical_size().unwrap(), disk.logical_size().unwrap());
+    }
+
+    #[test]
+    fn create_async_io_builds_worker() {
+        let dir = TempDir::new_with_prefix("/tmp/vmdk-test").unwrap();
+        let path =
+            write_flat_vmdk(dir.as_path(), "monolithicFlat", &[("disk-flat.vmdk", "RW", 2048)]);
+        let disk = VmdkDisk::new(open_descriptor(&path), &path, false).unwrap();
+
+        // Ring depth is ignored by the synchronous VMDK worker.
+        assert!(disk.create_async_io(0).is_ok());
+    }
+
+    #[test]
+    fn create_async_io_supports_multi_extent() {
+        let dir = TempDir::new_with_prefix("/tmp/vmdk-test").unwrap();
+        let path = write_flat_vmdk(
+            dir.as_path(),
+            "twoGbMaxExtentFlat",
+            &[("s001.vmdk", "RW", 2048), ("s002.vmdk", "RW", 2048)],
+        );
+        let disk = VmdkDisk::new(open_descriptor(&path), &path, false).unwrap();
+
+        assert!(disk.create_async_io(32).is_ok());
+    }
+}
