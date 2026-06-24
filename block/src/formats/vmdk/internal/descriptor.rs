@@ -28,7 +28,7 @@ pub enum VMDKDiskType {
 // <Access> <Size in sectors> <Type of extent> <filename>
 // ex: RW 2097152 FLAT "disk-s001.vmdk"
 #[derive(Debug, Default)]
-pub struct VmdkExtent {
+pub struct VmdkExtentHeader {
     pub access: String,
     pub size_in_sectors: u64,
     pub extent_type: String,
@@ -44,6 +44,9 @@ pub struct VmdkDescriptor {
     pub base_path: String,
     pub header: VmdkDescriptorHeader,
     pub extents_list: VmdkDescriptorExtents,
+    // TO-DO: Remove the unused warning
+    // For now, we are not using ddb information,
+    // but it is part of the descriptor file and we are parsing it.
     pub ddb: VmdkDescriptorDdb,
 }
 
@@ -60,7 +63,7 @@ pub struct VmdkDescriptorHeader {
 // VMDK text descriptor extents list
 #[derive(Debug, Default)]
 pub struct VmdkDescriptorExtents {
-    pub extents: Vec<VmdkExtent>,
+    pub extents: Vec<VmdkExtentHeader>,
 }
 
 // VMDK text descriptor disk database
@@ -195,7 +198,7 @@ pub(crate) fn parse_extents_and_ddb<R: BufRead>(
             // Parse the extent line
             let parts: Vec<&str> = line.split_whitespace().collect();
             if parts.len() >= 4 {
-                let extent = VmdkExtent {
+                let extent = VmdkExtentHeader {
                     access: parts[0].to_string(),
                     size_in_sectors: parts[1].parse().unwrap_or(0),
                     extent_type: parts[2].to_string(),

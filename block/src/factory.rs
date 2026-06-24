@@ -209,9 +209,21 @@ fn open_flat_vmdk(
     file: fs::File,
     options: &DiskOpenOptions<'_>,
 ) -> BlockResult<Box<dyn AsyncFullDiskFile>> {
+    // Supporting Asyncio and Syncio for VMDK.
+    // TO-DO: need more understanding for how io_uring can be used for VMDK,
+    // in terms of handling fd + offset in multi extent types.
+    if !options.disable_aio {
+        if aio_supported() {
+            info!("Opening VMDK disk in AIO mode");
+            return Ok(Box::new(
+                VmdkDisk::new(file, options.path, true).map_err(|e| e.with_path(options.path))?,
+            ));}
+        info!("AIO runtime probe failed for VMDK, using synchronous backend");
+    }
+
     info!("Opening VMDK disk file with synchronous backend");
     Ok(Box::new(
-        VmdkDisk::new(file, options.path).map_err(|e| e.with_path(options.path))?,
+        VmdkDisk::new(file, options.path, false).map_err(|e| e.with_path(options.path))?,
     ))
 }
 

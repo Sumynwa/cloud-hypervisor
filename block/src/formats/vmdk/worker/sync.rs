@@ -4,70 +4,290 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
+use std::collections::VecDeque;
 use std::io;
-use std::os::unix::io::RawFd;
+use std::os::unix::io::AsRawFd;
+use std::sync::Arc;
 
 use vmm_sys_util::eventfd::EventFd;
 
 use crate::async_io::{AsyncIo, AsyncIoCompletion, AsyncIoError, AsyncIoOperation, AsyncIoResult};
-use crate::formats::raw::worker::sync::RawSync;
+use crate::formats::vmdk::internal::flat::{ExtentAccess, VmdkExtent};
 
+/// Synchronous, extent-aware I/O worker for flat VMDK images.
+///
+/// Maps each guest request to one or more backing extents and performs the I/O
+/// with blocking `preadv`/`pwritev`. A request that stays within a single
+/// extent -- always true for `monolithicFlat`, and the common case for
+/// `twoGbMaxExtentFlat` -- takes a zero-copy fast path. Only a request that
+/// straddles an extent boundary is split into per-extent segments, each copied
+/// through a temporary buffer.
+///
+/// TO-DO: async backends (io_uring/AIO) submit one fd + one offset per
+/// operation and cannot express a single request spanning two extent files.
 pub struct FlatVmdkSync {
-    raw_file_sync: RawSync,
+    // Opened extents in virtual-disk order. Held here so the fds stay valid for
+    // the worker's lifetime, independent of the originating `FlatVmdk`.
+    extents: Arc<Vec<VmdkExtent>>,
+    // Total virtual disk size; requests beyond this are rejected.
     size: u64,
+    eventfd: EventFd,
+    completion_list: VecDeque<AsyncIoCompletion>,
 }
 
 impl FlatVmdkSync {
-    pub fn new(fd: RawFd, size: u64) -> io::Result<Self> {
+    pub fn new(extents: Arc<Vec<VmdkExtent>>, size: u64) -> io::Result<Self> {
         Ok(FlatVmdkSync {
-            raw_file_sync: RawSync::new(fd),
+            extents,
             size,
+            eventfd: EventFd::new(libc::EFD_NONBLOCK)?,
+            completion_list: VecDeque::new(),
         })
+    }
+
+    // Returns the extent containing virtual `offset`, or `None` if out of range.
+    fn extent_at(&self, offset: u64) -> Option<&VmdkExtent> {
+        self.extents
+            .iter()
+            .find(|e| offset >= e.virtual_start && offset < e.virtual_start + e.length)
+    }
+
+    // Validates that every extent the request touches permits the operation.
+    // Rejects any I/O to a `NoAccess` extent, and rejects writes to a
+    // `ReadOnly` extent, per the access mode declared in the descriptor.
+    fn check_access(&self, start: u64, total: u64, is_read: bool) -> io::Result<()> {
+        let end = start + total;
+        let mut cur = start;
+        while cur < end {
+            let extent = self.extent_at(cur).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "offset outside any VMDK extent")
+            })?;
+            match extent.access {
+                ExtentAccess::NoAccess => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        format!("VMDK extent at offset {cur} is NOACCESS; request rejected"),
+                    ));
+                }
+                ExtentAccess::ReadOnly if !is_read => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        format!("write to read-only VMDK extent at offset {cur} rejected"),
+                    ));
+                }
+                _ => {}
+            }
+            cur = extent.virtual_start + extent.length;
+        }
+        Ok(())
+    }
+
+    // Fast path: the whole request lives in `extent`, so the original iovecs can
+    // be submitted with a single vectored syscall (no intermediate copy).
+    fn single_extent_io(&self, extent: &VmdkExtent, op: &AsyncIoOperation) -> io::Result<usize> {
+        let file = extent.file.as_ref().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::PermissionDenied, "VMDK extent is not accessible")
+        })?;
+        let file_offset = (op.offset() as u64 - extent.virtual_start) as libc::off_t;
+        let iovecs = op.iovecs();
+        let fd = file.as_raw_fd();
+
+        // SAFETY: the iovec buffers are owned by `op` and remain valid for the
+        // duration of this call.
+        let res = unsafe {
+            if op.is_read() {
+                libc::preadv(fd, iovecs.as_ptr(), iovecs.len() as libc::c_int, file_offset)
+            } else {
+                libc::pwritev(fd, iovecs.as_ptr(), iovecs.len() as libc::c_int, file_offset)
+            }
+        };
+        if res < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(res as usize)
+    }
+
+    // Slow path: the request straddles >= 2 extents. Walk every extent it
+    // covers, copying each segment through a temporary buffer at the correct
+    // file offset, and report the total number of bytes transferred.
+    fn spanning_io(&self, op: &mut AsyncIoOperation) -> io::Result<usize> {
+        let start = op.offset() as u64;
+        let total = op.total_len() as u64;
+        let is_read = op.is_read();
+
+        let mut done: u64 = 0;
+        while done < total {
+            let cur = start + done;
+            let extent = self.extent_at(cur).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "offset outside any VMDK extent")
+            })?;
+            let extent_end = extent.virtual_start + extent.length;
+            // Bytes handled in this extent before reaching its boundary.
+            let seg_len = std::cmp::min(total - done, extent_end - cur) as usize;
+            let file = extent.file.as_ref().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::PermissionDenied, "VMDK extent is not accessible")
+            })?;
+            let file_offset = (cur - extent.virtual_start) as libc::off_t;
+            let fd = file.as_raw_fd();
+
+            let mut buf = vec![0u8; seg_len];
+            if is_read {
+                // SAFETY: `buf` is valid for `seg_len` bytes.
+                let res = unsafe {
+                    libc::pread(
+                        fd,
+                        buf.as_mut_ptr() as *mut libc::c_void,
+                        seg_len,
+                        file_offset,
+                    )
+                };
+                if res < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                let n = res as usize;
+                op.write_bytes_at(done as usize, &buf[..n])?;
+                done += n as u64;
+                if n < seg_len {
+                    break; // short read
+                }
+            } else {
+                op.read_bytes_at(done as usize, &mut buf)?;
+                // SAFETY: `buf` is valid for `seg_len` bytes.
+                let res = unsafe {
+                    libc::pwrite(
+                        fd,
+                        buf.as_ptr() as *const libc::c_void,
+                        seg_len,
+                        file_offset,
+                    )
+                };
+                if res < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                let n = res as usize;
+                done += n as u64;
+                if n < seg_len {
+                    break; // short write
+                }
+            }
+        }
+
+        // TO-DO: For short read/short write, we break out of loop
+        // and return the number of bytes processed so far.
+        // Should we return an error instead? Or is it okay to return the number of bytes processed so far?
+        Ok(done as usize)
     }
 }
 
 impl AsyncIo for FlatVmdkSync {
     fn notifier(&self) -> &EventFd {
-        self.raw_file_sync.notifier()
+        &self.eventfd
     }
 
-    fn submit_data_operation(&mut self, op: AsyncIoOperation) -> AsyncIoResult<()> {
-        let offset = op.offset();
-        if offset as u64 >= self.size {
+    fn submit_data_operation(&mut self, mut op: AsyncIoOperation) -> AsyncIoResult<()> {
+        let start = op.offset() as u64;
+        let total = op.total_len() as u64;
+        let is_read = op.is_read();
+
+        // Bounds check against the virtual disk size (overflow-safe: `start`
+        // is checked before subtracting it from `size`).
+        if start > self.size || total > self.size - start {
             let error = io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
-                    "Invalid offset {}, can't be larger than file size {}",
-                    offset, self.size
+                    "VMDK request [{start}, {}) exceeds virtual size {}",
+                    start + total,
+                    self.size
                 ),
             );
-            return Err(if op.is_read() {
+            return Err(if is_read {
                 AsyncIoError::ReadVectored(error)
             } else {
                 AsyncIoError::WriteVectored(error)
             });
         }
 
-        self.raw_file_sync.submit_data_operation(op)
+        // Reject the request up front if any extent it touches forbids it:
+        // NOACCESS extents reject all I/O, RDONLY extents reject writes.
+        if total != 0 {
+            if let Err(error) = self.check_access(start, total, is_read) {
+                return Err(if is_read {
+                    AsyncIoError::ReadVectored(error)
+                } else {
+                    AsyncIoError::WriteVectored(error)
+                });
+            }
+        }
+
+        let result = if total == 0 {
+            Ok(0)
+        } else if let Some(extent) = self.extent_at(start) {
+            if start + total <= extent.virtual_start + extent.length {
+                // Entire request fits in one extent -> zero-copy fast path.
+                self.single_extent_io(extent, &op)
+            } else {
+                // Request crosses an extent boundary -> segmented copy path.
+                self.spanning_io(&mut op)
+            }
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "offset outside any VMDK extent",
+            ))
+        };
+
+        let bytes = result.map_err(|e| {
+            if is_read {
+                AsyncIoError::ReadVectored(e)
+            } else {
+                AsyncIoError::WriteVectored(e)
+            }
+        })?;
+
+        self.completion_list
+            .push_back(AsyncIoCompletion::from_operation(op, bytes as i32));
+        self.eventfd.write(1).unwrap();
+        Ok(())
     }
 
     fn fsync(&mut self, user_data: Option<u64>) -> AsyncIoResult<()> {
-        self.raw_file_sync.fsync(user_data)
+        // Flush every extent: a single guest flush must durably persist data
+        // that may have been written across multiple extent files.
+        for extent in self.extents.iter() {
+            // Skip NoAccess extents, which have no open file.
+            if let Some(file) = extent.file.as_ref() {
+                // SAFETY: FFI call with a valid fd owned by the extent.
+                let res = unsafe { libc::fsync(file.as_raw_fd()) };
+                if res < 0 {
+                    return Err(AsyncIoError::Fsync(io::Error::last_os_error()));
+                }
+            }
+        }
+
+        if let Some(user_data) = user_data {
+            self.completion_list
+                .push_back(AsyncIoCompletion::new(user_data, 0, None));
+            self.eventfd.write(1).unwrap();
+        }
+
+        Ok(())
     }
 
     fn next_completed_request(&mut self) -> Option<AsyncIoCompletion> {
-        self.raw_file_sync.next_completed_request()
+        self.completion_list.pop_front()
     }
 
     fn punch_hole(&mut self, _offset: u64, _length: u64, _user_data: u64) -> AsyncIoResult<()> {
+        // Flat VMDK is not sparse-capable (see `SparseCapable` impl), so this
+        // should never be negotiated by the guest.
         Err(AsyncIoError::PunchHole(io::Error::other(
-            "punch_hole not supported for fixed VHD",
+            "punch_hole not supported for flat VMDK",
         )))
     }
 
     fn write_zeroes(&mut self, _offset: u64, _length: u64, _user_data: u64) -> AsyncIoResult<()> {
         Err(AsyncIoError::WriteZeroes(io::Error::other(
-            "write_zeroes not supported for fixed VHD",
+            "write_zeroes not supported for flat VMDK",
         )))
     }
 }
