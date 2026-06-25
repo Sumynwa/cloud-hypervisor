@@ -92,7 +92,22 @@ pub fn open_disk(options: &DiskOpenOptions<'_>) -> BlockResult<OpenedDisk> {
     }
 
     let mut file = open_disk_image(options.path, &fs_options)?;
-    let image_type = detect_image_type(&mut file)?;
+
+    // Image-type detection performs small, byte-granular probes:
+    // In case of VMDK, it parses the VMDK descriptor text through a `BufReader`.
+    // Those reads are not block-aligned, so under
+    // `O_DIRECT` (which requires the buffer address, length and offset to all
+    // be block-aligned) they fail with `EINVAL`. Detect the format on a
+    // separate buffered handle; the `O_DIRECT` `file` is retained for backend
+    // I/O.
+    let image_type = if options.direct {
+        let mut detect_options = fs::OpenOptions::new();
+        detect_options.read(true);
+        let mut detect_file = open_disk_image(options.path, &detect_options)?;
+        detect_image_type(&mut detect_file)?
+    } else {
+        detect_image_type(&mut file)?
+    };
 
     let disk: Box<dyn AsyncFullDiskFile> = match image_type {
         ImageType::FixedVhd => open_fixed_vhd(file, options)?,
