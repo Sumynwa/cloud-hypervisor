@@ -137,7 +137,7 @@ pub(crate) fn parse_header<R: BufRead>(
     if header_line.trim_end() != VMDK_DESCRIPTOR_HEADER {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "Not a VMDK descriptor file: missing header",
+            format!("Not a VMDK descriptor file: missing header: {}", header_line),
         ));
     }
 
@@ -252,11 +252,21 @@ pub(crate) fn parse_extents_and_ddb<R: BufRead>(
 // extent type = "FLAT"
 // For any other combination, the function returns false.
 pub fn is_flat_vmdk(f: &mut File) -> io::Result<bool> {
-    // Parse the descriptor directly via the helper parsers so we avoid
-    // constructing a full VmdkDescriptor, which requires a base path that
-    // the caller does not provide.
+    // Image-type detection runs several probes against the same File handle,
+    // and earlier ones move the cursor (is_fixed_vhd seeks to the end of the
+    // file). Rewind so the descriptor is read from its header.
+    f.seek(SeekFrom::Start(0))?;
+
     let mut reader = io::BufReader::new(f);
-    let (header, last_line) = parse_header(&mut reader)?;
+
+    // A missing/non-matching header (or otherwise malformed descriptor) just
+    // means this is not a flat VMDK. Return Ok(false) so detection falls
+    // through to the other formats instead of aborting with a fatal error.
+    let (header, last_line) = match parse_header(&mut reader) {
+        Ok(parsed) => parsed,
+        Err(e) if e.kind() == io::ErrorKind::InvalidData => return Ok(false),
+        Err(e) => return Err(e),
+    };
 
     // Only supports flat disk types for now. Other types can be added later.
     match header.create_type {
@@ -264,7 +274,11 @@ pub fn is_flat_vmdk(f: &mut File) -> io::Result<bool> {
         _ => return Ok(false),
     }
 
-    let (extents, _ddb) = parse_extents_and_ddb(&mut reader, &last_line)?;
+    let extents = match parse_extents_and_ddb(&mut reader, &last_line) {
+        Ok((extents, _ddb)) => extents,
+        Err(e) if e.kind() == io::ErrorKind::InvalidData => return Ok(false),
+        Err(e) => return Err(e),
+    };
 
     // Only supports flat extent types for now. Other types can be added later.
     for extent in &extents.extents {
