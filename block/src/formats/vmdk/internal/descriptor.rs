@@ -42,11 +42,16 @@ pub struct VmdkExtentHeader {
 #[derive(Debug, Default)]
 pub struct VmdkDescriptor {
     pub base_path: String,
+    // TO-DO: Remove the unused warning
+    // For now, we are not reading the parsed header back from the
+    // descriptor, but it is part of the descriptor file and we parse it.
+    #[allow(dead_code)]
     pub header: VmdkDescriptorHeader,
     pub extents_list: VmdkDescriptorExtents,
     // TO-DO: Remove the unused warning
     // For now, we are not using ddb information,
     // but it is part of the descriptor file and we are parsing it.
+    #[allow(dead_code)]
     pub ddb: VmdkDescriptorDdb,
 }
 
@@ -242,19 +247,22 @@ pub(crate) fn parse_extents_and_ddb<R: BufRead>(
 // extent type = "FLAT"
 // For any other combination, the function returns false.
 pub fn is_flat_vmdk(f: &mut File) -> io::Result<bool> {
-    // constuct a VmdkDescriptor from the file
-    // TO-DO: don't handle the descriptor file path here.
-    let descriptor = VmdkDescriptor::new(f, Path::new(""))?;
+    // Parse the descriptor directly via the helper parsers so we avoid
+    // constructing a full VmdkDescriptor, which requires a base path that
+    // the caller does not provide.
+    let mut reader = io::BufReader::new(f);
+    let (header, last_line) = parse_header(&mut reader)?;
 
     // Only supports flat disk types for now. Other types can be added later.
-    match descriptor.header.create_type {
-        VMDKDiskType::MonolithicFlat | VMDKDiskType::TwoGbMaxExtentFlat => {},
-        _ => {
-            return Ok(false)
-        }
+    match header.create_type {
+        VMDKDiskType::MonolithicFlat | VMDKDiskType::TwoGbMaxExtentFlat => {}
+        _ => return Ok(false),
     }
+
+    let (extents, _ddb) = parse_extents_and_ddb(&mut reader, &last_line)?;
+
     // Only supports flat extent types for now. Other types can be added later.
-    for extent in &descriptor.extents_list.extents {
+    for extent in &extents.extents {
         if extent.extent_type != "FLAT" {
             return Ok(false)
         }
