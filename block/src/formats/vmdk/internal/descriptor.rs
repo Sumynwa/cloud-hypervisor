@@ -4,7 +4,7 @@
 
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{self, BufRead};
+use std::io::{self, BufRead, Seek, SeekFrom};
 use std::path::Path;
 
 const VMDK_DESCRIPTOR_HEADER: &str = "# Disk DescriptorFile";
@@ -106,6 +106,11 @@ impl VmdkDescriptor {
         // The section line starts with '# ' followed by values for that section in subsequent lines.
         // Read the opened file line by line and parse the sections accordingly.
         let mut reader = io::BufReader::new(file);
+        // The same File handle may be shared with image-type detection
+        // (is_flat_vmdk), which advances the OS file offset. Do not assume the
+        // caller left the cursor at the start: rewind so parsing always begins
+        // at the descriptor header.
+        reader.seek(SeekFrom::Start(0))?;
         let (desc_header,last_line) = parse_header(&mut reader)?;
         let desc_extents_ddb = parse_extents_and_ddb(&mut reader, &last_line)?;
 
@@ -299,6 +304,46 @@ mod tests {
         let (header, last) = parse_header(&mut reader)?;
         let (extents, ddb) = parse_extents_and_ddb(&mut reader, &last)?;
         Ok((header, extents, ddb))
+    }
+
+    // ---- VmdkDescriptor::new: shared-cursor regression ----
+
+    #[test]
+    fn new_rewinds_shared_file_cursor() {
+        use std::io::Write;
+
+        use vmm_sys_util::tempfile::TempFile;
+
+        // A minimal but complete monolithicFlat descriptor.
+        let descriptor_text: &[u8] = b"# Disk DescriptorFile\n\
+                                       version=1\n\
+                                       createType=monolithicFlat\n\
+                                       # Extent description\n\
+                                       RW 2097152 FLAT \"disk-flat.vmdk\"\n\
+                                       # The Disk Data Base\n\
+                                       ddb.adapterType = \"ide\"\n";
+
+        // Write the descriptor to a temp file and rewind to the start.
+        let tmp = TempFile::new().unwrap();
+        let mut file: &File = tmp.as_file();
+        file.write_all(descriptor_text).unwrap();
+        file.seek(SeekFrom::Start(0)).unwrap();
+
+        // Advance the shared OS file offset using the parser helper, exactly
+        // as the image-type detection path (is_flat_vmdk) does. `&File` is
+        // `Copy`, so the BufReader operates on the same underlying fd/offset.
+        {
+            let mut reader = io::BufReader::new(file);
+            parse_header(&mut reader).unwrap();
+        }
+        // The cursor is now past the descriptor header, not at the start.
+        assert_ne!(file.stream_position().unwrap(), 0);
+
+        // Constructing the descriptor from the SAME file must still succeed,
+        // because `VmdkDescriptor::new` rewinds before parsing.
+        let descriptor = VmdkDescriptor::new(file, tmp.as_path()).unwrap();
+        assert_eq!(descriptor.extents_list.extents.len(), 1);
+        assert_eq!(descriptor.extents_list.extents[0].filename, "disk-flat.vmdk");
     }
 
     // ---- parse_extents_and_ddb: valid inputs ----
