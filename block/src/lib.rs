@@ -474,6 +474,26 @@ const QCOW_MAGIC: u32 = 0x5146_49fb;
 const VHDX_SIGN: u64 = 0x656C_6966_7864_6876;
 
 /// Read a block into memory aligned by the source block size (needed for O_DIRECT)
+///
+/// The buffer is sized to one logical block (>= 512 bytes), but some valid
+/// disk images are smaller than a full block. In particular a VMDK
+/// monolithicFlat *descriptor* is a small text file always well under 512.
+/// Image-type detection only inspects the first few bytes for magic values,
+/// so a short file is fine; using `read_exact` here, however, would fail such files with
+/// `UnexpectedEof` ("failed to fill whole buffer") before detection ever runs.
+///
+/// To support these we issue a single best-effort read and keep the zero
+/// padding for the unread tail (the buffer is zero-initialized via
+/// `alloc_zeroed`). The zero tail cannot spuriously match the QCOW2/VHDx magic
+/// constants, and `is_flat_vmdk` re-reads the descriptor from offset 0 itself.
+///
+/// The read must be a *single* full-block read from offset 0: the file may be
+/// opened with `O_DIRECT`, which requires the buffer address, length and file
+/// offset to all be block-aligned. Issuing a follow-up read for the remaining
+/// tail of a short file would start at an unaligned offset and fail with
+/// `EINVAL` ("Invalid argument"). A single read of the aligned, block-sized
+/// buffer satisfies O_DIRECT and returns `min(blocksize, file_len)` bytes,
+/// which is all detection needs.
 pub fn read_aligned_block_size(f: &mut File) -> std::io::Result<Vec<u8>> {
     let blocksize = DiskTopology::probe(f)?.logical_block_size as usize;
     // SAFETY: We are allocating memory that is naturally aligned (size = alignment) and we meet
@@ -486,7 +506,18 @@ pub fn read_aligned_block_size(f: &mut File) -> std::io::Result<Vec<u8>> {
             blocksize,
         )
     };
-    f.read_exact(&mut data)?;
+    // Single aligned read from offset 0. A file shorter than one logical block
+    // yields a short read; the unread tail stays zero-padded. We deliberately
+    // do not loop to fill the rest: a continuation read would be unaligned and
+    // break O_DIRECT (EINVAL). Retry only on EINTR, where no bytes were
+    // consumed so the offset is still 0 and the read stays aligned.
+    loop {
+        match f.read(&mut data) {
+            Ok(_) => break,
+            Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
+    }
     Ok(data)
 }
 
