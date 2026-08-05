@@ -9,7 +9,7 @@ use std::ffi::{CString, OsStr};
 use std::fs::{File, OpenOptions, canonicalize, read_link};
 use std::io;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::path::{Component, Path};
 use std::sync::Arc;
@@ -271,10 +271,15 @@ fn open_extent_walk(
 }
 
 // Requires an opened absolute extent to resolve inside a trusted image-store
-// root. Reads the file's real path via /proc/self/fd (symlinks and `..` already
-// collapsed by the kernel) and prefix-matches it against the canonicalized
-// roots. Fails closed (with an explicit log) when /proc is unavailable.
+// root.
 fn verify_within_trusted_root(file: &File) -> io::Result<()> {
+    if file.metadata()?.nlink() == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "VMDK absolute extent backing file was deleted; cannot verify containment",
+        ));
+    }
+
     let proc_path = format!("/proc/self/fd/{}", file.as_raw_fd());
     let resolved = read_link(&proc_path).map_err(|e| {
         io::Error::new(
@@ -785,6 +790,23 @@ mod tests {
 
         let via = base.join("link").join("passwd");
         open_extent("/unused-base", via.to_str().unwrap(), false, false).unwrap_err();
+    }
+
+    #[test]
+    fn verify_within_trusted_root_rejects_deleted_file() {
+        use vmm_sys_util::tempdir::TempDir;
+
+        // A trusted-root file that is unlinked while still open has nlink 0 and
+        // no live path; containment can't be verified, so it must be refused
+        // even though its (now stale) resolved path would still be under /tmp.
+        let dir = TempDir::new_with_prefix("/tmp/vmdk-deleted-test").unwrap();
+        let path = dir.as_path().join("blob.vmdk");
+        fs::write(&path, b"data").unwrap();
+        let file = File::open(&path).unwrap();
+
+        verify_within_trusted_root(&file).unwrap();
+        fs::remove_file(&path).unwrap();
+        verify_within_trusted_root(&file).unwrap_err();
     }
 
     #[test]
