@@ -6,7 +6,7 @@
 //! descriptor and maps the virtual disk onto them.
 
 use std::ffi::{CString, OsStr};
-use std::fs::{File, OpenOptions};
+use std::fs::{File, OpenOptions, canonicalize, read_link};
 use std::io;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::OpenOptionsExt;
@@ -72,6 +72,20 @@ struct OpenHow {
     resolve: u64,
 }
 
+// openat2(2) RESOLVE_* flags from <linux/openat2.h>, not exposed by libc on all
+// targets.
+const RESOLVE_NO_MAGICLINKS: u64 = 0x02;
+const RESOLVE_BENEATH: u64 = 0x08;
+
+// Absolute extents are only accepted when the file they ultimately resolve to
+// lives inside one of these trusted image-store roots: /var for the containerd
+// blob store and /run for Kata's per-sandbox padding images. Roots are
+// canonicalized before matching. TODO: make configurable.
+#[cfg(not(test))]
+const TRUSTED_ABSOLUTE_ROOTS: &[&str] = &["/var", "/run"];
+#[cfg(test)]
+const TRUSTED_ABSOLUTE_ROOTS: &[&str] = &["/var", "/run", "/tmp"];
+
 // Splits an untrusted extent `filename` into its `Normal` path components for
 // the fallback walk, rejecting any `..`/`.` traversal.
 fn extent_components(filename: &str) -> io::Result<Vec<&OsStr>> {
@@ -103,40 +117,48 @@ fn extent_components(filename: &str) -> io::Result<Vec<&OsStr>> {
 // Opens a single VMDK data extent for the descriptor whose directory is
 // base_path.
 //
-// The extent name may be relative to the descriptor or an absolute path. The
-// only difference between the two is:
-//   - relative -> colocated with descriptor file
-//   - absolute -> the filesystem root
-// The symlink policy rejects the final component if it is a symlink (O_NOFOLLOW).
+// The extent name may be relative to the descriptor directory or an absolute
+// path. Absolute extents follow symlinks freely but must, after resolution,
+// live inside a trusted image-store root (TRUSTED_ABSOLUTE_ROOTS).
+// This permits in-tree symlinks while rejecting escapes.
+// Magic links are never followed (RESOLVE_NO_MAGICLINKS) and the final component
+// may not be a symlink (O_NOFOLLOW).
 //
-// Resolution prefers openat2(2). On kernels without it (< 5.6, ENOSYS) or
-// where it is blocked (EPERM, e.g. a seccomp filter), it falls back to a
-// per-component openat walk.
+// Resolution prefers openat2(2). On kernels without it (< 5.6, ENOSYS) or where
+// it is blocked (EPERM, e.g. a seccomp filter), it falls back to a per-component
+// openat walk that still rejects `..`/`.` but cannot express full BENEATH
+// containment.
 fn open_extent(
     base_path: &str,
     filename: &str,
     writable: bool,
     direct: bool,
 ) -> io::Result<AlignedFile> {
-    let anchor = if Path::new(filename).is_absolute() {
-        "/"
-    } else {
-        base_path
-    };
+    let is_absolute = Path::new(filename).is_absolute();
+    let anchor = if is_absolute { "/" } else { base_path };
 
     let dir = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC)
         .open(anchor)?;
 
-    match open_extent_openat2(dir.as_raw_fd(), filename, writable, direct) {
-        Ok(file) => Ok(AlignedFile::new(file, direct)),
+    let aligned = match open_extent_openat2(dir.as_raw_fd(), filename, writable, direct) {
+        Ok(file) => AlignedFile::new(file, direct),
         Err(e) if matches!(e.raw_os_error(), Some(libc::ENOSYS) | Some(libc::EPERM)) => {
             let components = extent_components(filename)?;
-            open_extent_walk(dir, &components, writable, direct)
+            open_extent_walk(dir, &components, writable, direct)?
         }
-        Err(e) => Err(e),
+        Err(e) => return Err(e),
+    };
+
+    // Relative extents are confined beneath base_path by RESOLVE_BENEATH.
+    // Absolute extents follow symlinks freely, so require the file we actually
+    // opened to resolve inside a trusted image-store root.
+    if is_absolute {
+        verify_within_trusted_root(aligned.file())?;
     }
+
+    Ok(aligned)
 }
 
 fn open_extent_openat2(
@@ -162,10 +184,19 @@ fn open_extent_openat2(
     if direct {
         flags |= libc::O_DIRECT;
     }
+
+    // Confine a relative extent name beneath the descriptor directory. An
+    // absolute name is anchored at the filesystem root by the caller and its
+    // policy is deliberately left unchanged here, so RESOLVE_BENEATH (which
+    // rejects absolute pathnames outright) is not applied to it.
+    let mut resolve = RESOLVE_NO_MAGICLINKS;
+    if !Path::new(filename).is_absolute() {
+        resolve |= RESOLVE_BENEATH;
+    }
     let how = OpenHow {
         flags: flags as u64,
         mode: 0,
-        resolve: 0,
+        resolve,
     };
 
     // SAFETY: FFI syscall. `cname` is NUL-terminated and outlives the call,
@@ -237,6 +268,43 @@ fn open_extent_walk(
     }
 
     unreachable!("extent_components guarantees at least one component")
+}
+
+// Requires an opened absolute extent to resolve inside a trusted image-store
+// root. Reads the file's real path via /proc/self/fd (symlinks and `..` already
+// collapsed by the kernel) and prefix-matches it against the canonicalized
+// roots. Fails closed (with an explicit log) when /proc is unavailable.
+fn verify_within_trusted_root(file: &File) -> io::Result<()> {
+    let proc_path = format!("/proc/self/fd/{}", file.as_raw_fd());
+    let resolved = read_link(&proc_path).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "cannot verify VMDK absolute extent: reading '{proc_path}' failed ({e}); is /proc \
+                 mounted?"
+            ),
+        )
+    })?;
+
+    // Canonicalize each root so a symlinked root path (e.g. /var -> /mnt/var)
+    // still matches the kernel-resolved extent path. A root that does not exist
+    // canonicalizes with an error and simply never matches.
+    let trusted = TRUSTED_ABSOLUTE_ROOTS
+        .iter()
+        .filter_map(|&root| canonicalize(root).ok())
+        .any(|root| resolved.starts_with(root));
+
+    if trusted {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "VMDK absolute extent resolves to '{}', outside any trusted image-store root",
+                resolved.display()
+            ),
+        ))
+    }
 }
 
 // Builds the error returned when a sector count/offset from the (untrusted)
@@ -596,18 +664,40 @@ mod tests {
 
         use vmm_sys_util::tempdir::TempDir;
 
-        // A relative path may traverse a symlinked intermediate directory
-        // (only the final component is guarded).
-        let real = TempDir::new_with_prefix("/tmp/vmdk-rel-real-test").unwrap();
-        fs::write(real.as_path().join("s001.vmdk"), b"data").unwrap();
-
+        // A relative extent may traverse a symlinked intermediate directory as
+        // long as it stays beneath the anchor. A *relative* symlink target keeps
+        // resolution within the anchor, which RESOLVE_BENEATH permits.
         let dir = TempDir::new_with_prefix("/tmp/vmdk-rel-symdir-test").unwrap();
         let base = dir.as_path();
-        symlink(real.as_path(), base.join("sub")).unwrap();
+        fs::create_dir(base.join("real")).unwrap();
+        fs::write(base.join("real").join("s001.vmdk"), b"data").unwrap();
+        symlink("real", base.join("sub")).unwrap();
 
         let (openat2_res, walk_res) = open_both(base, "sub/s001.vmdk", false, false);
         check_openat2(&openat2_res, true);
         check_walk(&walk_res, true);
+    }
+
+    #[test]
+    fn open_extent_openat2_rejects_relative_symlink_escape() {
+        use std::os::unix::fs::symlink;
+
+        use vmm_sys_util::tempdir::TempDir;
+
+        // RESOLVE_BENEATH confines relative extents beneath the anchor even
+        // through symlinks: a relative extent whose intermediate symlink leaves
+        // the anchor is refused. openat2 is the enforced path (the walk fallback
+        // cannot express this), so only openat2 is asserted here.
+        let outside = TempDir::new_with_prefix("/tmp/vmdk-escape-outside").unwrap();
+        fs::write(outside.as_path().join("s001.vmdk"), b"secret").unwrap();
+
+        let dir = TempDir::new_with_prefix("/tmp/vmdk-escape-anchor").unwrap();
+        let base = dir.as_path();
+        symlink(outside.as_path(), base.join("sub")).unwrap();
+
+        let anchor = open_dir(base);
+        let res = open_extent_openat2(anchor.as_raw_fd(), "sub/s001.vmdk", false, false);
+        check_openat2(&res, false);
     }
 
     #[test]
@@ -629,5 +719,105 @@ mod tests {
         let (openat2_res, walk_res) = open_both(base, via_symlink.to_str().unwrap(), false, false);
         check_openat2(&openat2_res, true);
         check_walk(&walk_res, true);
+    }
+
+    #[test]
+    fn open_extent_rejects_parent_dir_traversal() {
+        use vmm_sys_util::tempdir::TempDir;
+
+        // A descriptor-supplied extent name must not climb out of its anchor
+        // directory with `..`, otherwise a crafted image could reach arbitrary
+        // host files. Both open paths must refuse it.
+        //
+        // Layout:
+        //   root/
+        //     secret     <- must NOT be reachable through the extent name
+        //     anchor/    <- the "descriptor directory" used as the open anchor
+        let root = TempDir::new_with_prefix("/tmp/vmdk-traversal-test").unwrap();
+        let anchor = root.as_path().join("anchor");
+        fs::create_dir(&anchor).unwrap();
+        fs::write(root.as_path().join("secret"), b"secret").unwrap();
+
+        // `..` climbs out of `anchor` back into `root` and reaches `secret`.
+        let (openat2_res, walk_res) = open_both(&anchor, "../secret", false, false);
+        check_openat2(&openat2_res, false);
+        check_walk(&walk_res, false);
+    }
+
+    #[test]
+    fn open_extent_allows_absolute_in_tree_symlink() {
+        use std::os::unix::fs::symlink;
+
+        use vmm_sys_util::tempdir::TempDir;
+
+        // /tmp is a trusted root in tests. An absolute extent that reaches its
+        // blob through an in-tree symlink -- including an absolute-target one,
+        // which RESOLVE_BENEATH would reject -- is allowed, because the resolved
+        // path stays under the trusted root.
+        let dir = TempDir::new_with_prefix("/tmp/vmdk-intree-sym").unwrap();
+        let base = dir.as_path();
+        fs::create_dir(base.join("real")).unwrap();
+        fs::write(base.join("real").join("blob.vmdk"), b"data").unwrap();
+        symlink(base.join("real"), base.join("link")).unwrap();
+
+        let via = base.join("link").join("blob.vmdk");
+        open_extent("/unused-base", via.to_str().unwrap(), false, false).unwrap();
+    }
+
+    #[test]
+    fn open_extent_rejects_absolute_outside_trusted_root() {
+        // A real host file outside every trusted root is refused even though it
+        // opens (regular, non-symlink final component).
+        open_extent("/unused-base", "/etc/passwd", false, false).unwrap_err();
+    }
+
+    #[test]
+    fn open_extent_rejects_absolute_symlink_escaping_trusted_root() {
+        use std::os::unix::fs::symlink;
+
+        use vmm_sys_util::tempdir::TempDir;
+
+        // Literal path is under trusted /tmp, but an intermediate symlink escapes
+        // it, the resolved-path check refuses the escape.
+        let dir = TempDir::new_with_prefix("/tmp/vmdk-escape-sym").unwrap();
+        let base = dir.as_path();
+        symlink("/etc", base.join("link")).unwrap();
+
+        let via = base.join("link").join("passwd");
+        open_extent("/unused-base", via.to_str().unwrap(), false, false).unwrap_err();
+    }
+
+    #[test]
+    fn open_extent_rejects_relative_traversal() {
+        use vmm_sys_util::tempdir::TempDir;
+
+        // Regression test for the extent path traversal: a descriptor naming
+        // its extent "../escape.vmdk" must not reach a file outside the
+        // descriptor's own directory. Both implementations refuse it, openat2
+        // via RESOLVE_BENEATH (EXDEV) and the walk via `extent_components`.
+        let outer = TempDir::new_with_prefix("/tmp/vmdk-traversal-test").unwrap();
+        fs::write(outer.as_path().join("escape.vmdk"), b"secret").unwrap();
+        let base = outer.as_path().join("descriptor-dir");
+        fs::create_dir(&base).unwrap();
+
+        for name in [
+            "../escape.vmdk",
+            "./../escape.vmdk",
+            "sub/../../escape.vmdk",
+        ] {
+            let (openat2_res, walk_res) = open_both(&base, name, true, false);
+            check_openat2(&openat2_res, false);
+            check_walk(&walk_res, false);
+        }
+
+        // And the refusal surfaces from `open_extent` itself: EXDEV is not in
+        // the ENOSYS/EPERM fallback condition, so it is a hard error rather
+        // than a silent downgrade to the permissive walk.
+        let err = open_extent(base.to_str().unwrap(), "../escape.vmdk", true, false).unwrap_err();
+        assert_eq!(
+            err.raw_os_error(),
+            Some(libc::EXDEV),
+            "extent traversal must fail with EXDEV, not fall back to the walk"
+        );
     }
 }
