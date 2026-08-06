@@ -2742,6 +2742,8 @@ impl DeviceManager {
                 .as_ref()
                 .ok_or(DeviceManagerError::NoDiskPath)?;
 
+            let trusted_roots = disk_cfg.resolved_trusted_roots();
+
             let opened = open_disk(&DiskOpenOptions {
                 path: disk_path,
                 readonly: disk_cfg.readonly,
@@ -2750,6 +2752,7 @@ impl DeviceManager {
                 backing_files: disk_cfg.backing_files,
                 disable_io_uring: disk_cfg.disable_io_uring,
                 disable_aio: disk_cfg.disable_aio,
+                trusted_roots: &trusted_roots,
             })
             .map_err(DeviceManagerError::Disk)?;
 

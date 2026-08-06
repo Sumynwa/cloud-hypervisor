@@ -1448,7 +1448,8 @@ impl DiskConfig {
          rate_limit_group=<group_id>,\
          queue_affinity=<list_of_queue_indices_with_their_associated_cpuset>,\
          serial=<serial_number>,backing_files=on|off,sparse=on|off,\
-         image_type=<raw,qcow2,vhd,vhdx>,lock_granularity=byte-range|full";
+         image_type=<raw,qcow2,vhd,vhdx>,trusted_roots=<path1:path2:...|none>,\
+         lock_granularity=byte-range|full";
 
     pub fn parse(disk: &str) -> Result<Self> {
         let mut parser = OptionParser::new();
@@ -1475,6 +1476,7 @@ impl DiskConfig {
             .add("sparse")
             .add("image_type")
             .add("lock_granularity")
+            .add("trusted_roots")
             .add_all(PciDeviceCommonConfig::OPTIONS_IOMMU);
 
         parser.parse(disk).map_err(Error::ParseDisk)?;
@@ -1572,6 +1574,20 @@ impl DiskConfig {
             .map_err(Error::ParseDisk)?
             .unwrap_or_default();
 
+        // Colon-separated list of trusted roots for image-embedded absolute
+        // paths. Absent means "use the built-in default"; the literal `none`
+        // forbids absolute references entirely (relative only).
+        let trusted_roots = parser.get("trusted_roots").map(|s| {
+            if s.eq_ignore_ascii_case("none") {
+                Vec::new()
+            } else {
+                s.split(':')
+                    .filter(|p| !p.is_empty())
+                    .map(PathBuf::from)
+                    .collect::<Vec<_>>()
+            }
+        });
+
         let bw_tb_config = if bw_size != 0 && bw_refill_time != 0 {
             Some(TokenBucketConfig {
                 size: bw_size,
@@ -1625,6 +1641,7 @@ impl DiskConfig {
             sparse,
             image_type,
             lock_granularity,
+            trusted_roots,
         })
     }
 
@@ -4394,7 +4411,53 @@ mod unit_tests {
             sparse: true,
             image_type: ImageType::Unknown,
             lock_granularity: LockGranularityChoice::default(),
+            trusted_roots: None,
         }
+    }
+
+    #[test]
+    fn test_disk_trusted_roots_parsing() -> Result<()> {
+        // A colon-separated list becomes an explicit set of roots.
+        assert_eq!(
+            DiskConfig::parse(
+                "path=/path/to_file,trusted_roots=/var/lib/containerd:/run/kata-containers"
+            )?
+            .trusted_roots,
+            Some(vec![
+                PathBuf::from("/var/lib/containerd"),
+                PathBuf::from("/run/kata-containers"),
+            ])
+        );
+
+        // Absent means "use the built-in default" (None at parse time).
+        assert_eq!(DiskConfig::parse("path=/path/to_file")?.trusted_roots, None);
+
+        // The literal `none` forbids absolute references (relative only).
+        assert_eq!(
+            DiskConfig::parse("path=/path/to_file,trusted_roots=none")?.trusted_roots,
+            Some(vec![])
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_disk_resolved_trusted_roots() {
+        // No built-in default: unset resolves to an empty set (relative-only).
+        assert!(
+            DiskConfig::parse("path=/path/to_file")
+                .unwrap()
+                .resolved_trusted_roots()
+                .is_empty()
+        );
+
+        // The `none` sentinel is likewise empty (relative-only lockdown).
+        assert!(
+            DiskConfig::parse("path=/path/to_file,trusted_roots=none")
+                .unwrap()
+                .resolved_trusted_roots()
+                .is_empty()
+        );
     }
 
     #[test]

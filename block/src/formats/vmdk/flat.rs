@@ -6,17 +6,18 @@
 //! descriptor and maps the virtual disk onto them.
 
 use std::ffi::{CString, OsStr};
-use std::fs::{File, OpenOptions, canonicalize, read_link};
+use std::fs::{File, OpenOptions};
 use std::io;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
-use std::path::{Component, Path};
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
 use log::warn;
 
 use crate::formats::vmdk::descriptor::VmdkDescriptor;
+use crate::trusted_root::verify_within_trusted_root;
 use crate::{AlignedFile, DiskTopology, query_device_size};
 
 const VMDK_SECTOR_SIZE: u64 = 512;
@@ -77,15 +78,6 @@ struct OpenHow {
 const RESOLVE_NO_MAGICLINKS: u64 = 0x02;
 const RESOLVE_BENEATH: u64 = 0x08;
 
-// Absolute extents are only accepted when the file they ultimately resolve to
-// lives inside one of these trusted image-store roots: /var for the containerd
-// blob store and /run for Kata's per-sandbox padding images. Roots are
-// canonicalized before matching. TODO: make configurable.
-#[cfg(not(test))]
-const TRUSTED_ABSOLUTE_ROOTS: &[&str] = &["/var", "/run"];
-#[cfg(test)]
-const TRUSTED_ABSOLUTE_ROOTS: &[&str] = &["/var", "/run", "/tmp"];
-
 // Splits an untrusted extent `filename` into its `Normal` path components for
 // the fallback walk, rejecting any `..`/`.` traversal.
 fn extent_components(filename: &str) -> io::Result<Vec<&OsStr>> {
@@ -118,11 +110,11 @@ fn extent_components(filename: &str) -> io::Result<Vec<&OsStr>> {
 // base_path.
 //
 // The extent name may be relative to the descriptor directory or an absolute
-// path. Absolute extents follow symlinks freely but must, after resolution,
-// live inside a trusted image-store root (TRUSTED_ABSOLUTE_ROOTS).
-// This permits in-tree symlinks while rejecting escapes.
-// Magic links are never followed (RESOLVE_NO_MAGICLINKS) and the final component
-// may not be a symlink (O_NOFOLLOW).
+// path. Relative extents are confined beneath base_path. Absolute extents
+// follow symlinks freely but must, after resolution, live inside one of
+// `trusted_roots`; an empty `trusted_roots` forbids absolute extents entirely
+// (relative-only). Magic links are never followed (RESOLVE_NO_MAGICLINKS) and
+// the final component may not be a symlink (O_NOFOLLOW).
 //
 // Resolution prefers openat2(2). On kernels without it (< 5.6, ENOSYS) or where
 // it is blocked (EPERM, e.g. a seccomp filter), it falls back to a per-component
@@ -133,8 +125,22 @@ fn open_extent(
     filename: &str,
     writable: bool,
     direct: bool,
+    trusted_roots: &[PathBuf],
 ) -> io::Result<AlignedFile> {
     let is_absolute = Path::new(filename).is_absolute();
+
+    // Fail closed: without a configured trusted root, absolute extents are not
+    // permitted at all, so reject before opening anything.
+    if is_absolute && trusted_roots.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "VMDK absolute extent '{filename}' is not permitted: no trusted root is \
+                 configured (relative extents only)"
+            ),
+        ));
+    }
+
     let anchor = if is_absolute { "/" } else { base_path };
 
     let dir = OpenOptions::new()
@@ -153,9 +159,9 @@ fn open_extent(
 
     // Relative extents are confined beneath base_path by RESOLVE_BENEATH.
     // Absolute extents follow symlinks freely, so require the file we actually
-    // opened to resolve inside a trusted image-store root.
+    // opened to resolve inside a trusted root.
     if is_absolute {
-        verify_within_trusted_root(aligned.file())?;
+        verify_within_trusted_root(aligned.file(), trusted_roots)?;
     }
 
     Ok(aligned)
@@ -270,48 +276,6 @@ fn open_extent_walk(
     unreachable!("extent_components guarantees at least one component")
 }
 
-// Requires an opened absolute extent to resolve inside a trusted image-store
-// root.
-fn verify_within_trusted_root(file: &File) -> io::Result<()> {
-    if file.metadata()?.nlink() == 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "VMDK absolute extent backing file was deleted; cannot verify containment",
-        ));
-    }
-
-    let proc_path = format!("/proc/self/fd/{}", file.as_raw_fd());
-    let resolved = read_link(&proc_path).map_err(|e| {
-        io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            format!(
-                "cannot verify VMDK absolute extent: reading '{proc_path}' failed ({e}); is /proc \
-                 mounted?"
-            ),
-        )
-    })?;
-
-    // Canonicalize each root so a symlinked root path (e.g. /var -> /mnt/var)
-    // still matches the kernel-resolved extent path. A root that does not exist
-    // canonicalizes with an error and simply never matches.
-    let trusted = TRUSTED_ABSOLUTE_ROOTS
-        .iter()
-        .filter_map(|&root| canonicalize(root).ok())
-        .any(|root| resolved.starts_with(root));
-
-    if trusted {
-        Ok(())
-    } else {
-        Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            format!(
-                "VMDK absolute extent resolves to '{}', outside any trusted image-store root",
-                resolved.display()
-            ),
-        ))
-    }
-}
-
 // Builds the error returned when a sector count/offset from the (untrusted)
 // descriptor, scaled to bytes, does not fit in a u64.
 fn overflow_error(what: &str) -> io::Error {
@@ -323,7 +287,15 @@ fn overflow_error(what: &str) -> io::Error {
 
 impl FlatVmdk {
     /// Opens a flat VMDK image from its already-open descriptor file.
-    pub fn new(file: File, path: &Path, direct: bool) -> io::Result<Self> {
+    ///
+    /// `trusted_roots` bounds where absolute extents may resolve; an empty slice
+    /// forbids absolute extents (relative extents only).
+    pub fn new(
+        file: File,
+        path: &Path,
+        direct: bool,
+        trusted_roots: &[PathBuf],
+    ) -> io::Result<Self> {
         let descriptor = VmdkDescriptor::new(&file, path)?;
 
         if descriptor.extents_list.extents.is_empty() {
@@ -368,11 +340,23 @@ impl FlatVmdk {
             //   "NOACCESS" -> not accessible, do not open the file at all
             let (access, extent_file) = match extent.access.as_str() {
                 "RW" => {
-                    let f = open_extent(&descriptor.base_path, &extent.filename, true, direct)?;
+                    let f = open_extent(
+                        &descriptor.base_path,
+                        &extent.filename,
+                        true,
+                        direct,
+                        trusted_roots,
+                    )?;
                     (ExtentAccess::ReadWrite, Some(f))
                 }
                 "RDONLY" => {
-                    let f = open_extent(&descriptor.base_path, &extent.filename, false, direct)?;
+                    let f = open_extent(
+                        &descriptor.base_path,
+                        &extent.filename,
+                        false,
+                        direct,
+                        trusted_roots,
+                    )?;
                     (ExtentAccess::ReadOnly, Some(f))
                 }
                 "NOACCESS" => (ExtentAccess::NoAccess, None),
@@ -766,14 +750,35 @@ mod tests {
         symlink(base.join("real"), base.join("link")).unwrap();
 
         let via = base.join("link").join("blob.vmdk");
-        open_extent("/unused-base", via.to_str().unwrap(), false, false).unwrap();
+        open_extent(
+            "/unused-base",
+            via.to_str().unwrap(),
+            false,
+            false,
+            &[PathBuf::from("/tmp")],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn open_extent_rejects_absolute_when_no_trusted_root() {
+        // With no configured trusted root, absolute extents are refused outright
+        // (relative-only) without even opening the target.
+        open_extent("/unused-base", "/etc/passwd", false, false, &[]).unwrap_err();
     }
 
     #[test]
     fn open_extent_rejects_absolute_outside_trusted_root() {
         // A real host file outside every trusted root is refused even though it
         // opens (regular, non-symlink final component).
-        open_extent("/unused-base", "/etc/passwd", false, false).unwrap_err();
+        open_extent(
+            "/unused-base",
+            "/etc/passwd",
+            false,
+            false,
+            &[PathBuf::from("/tmp")],
+        )
+        .unwrap_err();
     }
 
     #[test]
@@ -789,24 +794,14 @@ mod tests {
         symlink("/etc", base.join("link")).unwrap();
 
         let via = base.join("link").join("passwd");
-        open_extent("/unused-base", via.to_str().unwrap(), false, false).unwrap_err();
-    }
-
-    #[test]
-    fn verify_within_trusted_root_rejects_deleted_file() {
-        use vmm_sys_util::tempdir::TempDir;
-
-        // A trusted-root file that is unlinked while still open has nlink 0 and
-        // no live path; containment can't be verified, so it must be refused
-        // even though its (now stale) resolved path would still be under /tmp.
-        let dir = TempDir::new_with_prefix("/tmp/vmdk-deleted-test").unwrap();
-        let path = dir.as_path().join("blob.vmdk");
-        fs::write(&path, b"data").unwrap();
-        let file = File::open(&path).unwrap();
-
-        verify_within_trusted_root(&file).unwrap();
-        fs::remove_file(&path).unwrap();
-        verify_within_trusted_root(&file).unwrap_err();
+        open_extent(
+            "/unused-base",
+            via.to_str().unwrap(),
+            false,
+            false,
+            &[PathBuf::from("/tmp")],
+        )
+        .unwrap_err();
     }
 
     #[test]
@@ -826,6 +821,7 @@ mod tests {
             "../escape.vmdk",
             "./../escape.vmdk",
             "sub/../../escape.vmdk",
+            "../../../etc/passwd",
         ] {
             let (openat2_res, walk_res) = open_both(&base, name, true, false);
             check_openat2(&openat2_res, false);
@@ -835,7 +831,8 @@ mod tests {
         // And the refusal surfaces from `open_extent` itself: EXDEV is not in
         // the ENOSYS/EPERM fallback condition, so it is a hard error rather
         // than a silent downgrade to the permissive walk.
-        let err = open_extent(base.to_str().unwrap(), "../escape.vmdk", true, false).unwrap_err();
+        let err =
+            open_extent(base.to_str().unwrap(), "../escape.vmdk", true, false, &[]).unwrap_err();
         assert_eq!(
             err.raw_os_error(),
             Some(libc::EXDEV),

@@ -10,7 +10,7 @@
 //! a trait object that is ready for use by virtio queue workers.
 
 use std::os::unix::fs::OpenOptionsExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::{fmt, fs};
 
@@ -38,6 +38,7 @@ pub struct DiskOpenOptions<'a> {
     pub backing_files: bool,
     pub disable_io_uring: bool,
     pub disable_aio: bool,
+    pub trusted_roots: &'a [PathBuf],
 }
 
 /// Result of [`open_disk`], carrying the detected image type alongside
@@ -223,7 +224,8 @@ fn open_flat_vmdk(
 ) -> BlockResult<Box<dyn AsyncFullDiskFile>> {
     info!("Opening VMDK disk file with synchronous backend");
     Ok(Box::new(
-        VmdkDisk::new(file, options.path, options.direct).map_err(|e| e.with_path(options.path))?,
+        VmdkDisk::new(file, options.path, options.direct, options.trusted_roots)
+            .map_err(|e| e.with_path(options.path))?,
     ))
 }
 
@@ -245,6 +247,7 @@ mod unit_tests {
             backing_files: false,
             disable_io_uring: true,
             disable_aio: true,
+            trusted_roots: &[],
         }
     }
 
@@ -304,6 +307,7 @@ mod unit_tests {
             backing_files: false,
             disable_io_uring: true,
             disable_aio: true,
+            trusted_roots: &[],
         };
         let opened = open_disk(&options).unwrap();
         assert_eq!(opened.image_type, ImageType::Raw);

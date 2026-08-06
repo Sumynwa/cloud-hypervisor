@@ -416,6 +416,14 @@ pub struct DiskConfig {
     pub image_type: ImageType,
     #[serde(default)]
     pub lock_granularity: LockGranularityChoice,
+    #[serde(default)]
+    pub trusted_roots: Option<Vec<PathBuf>>,
+}
+
+impl DiskConfig {
+    pub fn resolved_trusted_roots(&self) -> Vec<PathBuf> {
+        self.trusted_roots.clone().unwrap_or_default()
+    }
 }
 
 impl ApplyLandlock for DiskConfig {
